@@ -1,8 +1,9 @@
 %% ANALYZE_PHASE_DIFFS  Анализ разности фаз каналов по файлам data_<...>.bin.
 %
-% Скрипт (пункт 4 задания). Для каждого файла data_<DDMMHH>_<f>_<fd>.bin:
+% Скрипт (пункт 4 задания). Для каждого файла data_<DDMMHH>_<f>_<fd>.bin
+% (fd может быть ОТРИЦАТЕЛЬНЫМ и записываться как 5, так и -5):
 %   - читает IQ-кадр (формат PELENGATOR IQ CAPTURE V1);
-%   - оценивает фазы каналов на частоте тона fd (из имени файла);
+%   - оценивает фазы каналов на частоте тона fd (из имени файла, со знаком);
 %   - строит матрицу разностей фаз 4x4 (теплокарта с числами) и кривые
 %     Δφ_k - Δφ_1 относительно канала 1 (ch0);
 %   - оценивает межканальные задержки Δτ = Δφ / (2*pi*fd);
@@ -16,16 +17,34 @@
 %   консольная таблица + заключение о линейности Δφ(fd).
 %
 % НАСТРОЙКА: путь к папке с данными — в блоке НАСТРОЙКИ.
+% Запуск: analyze_phase_diffs (файл-функция — параметры внутри, локальные
+% функции ниже; скрипт-локальные функции Octave не поддерживает).
+% Опционально: analyze_phase_diffs(struct('DataDir', '...')) — переопределить
+% настройки (DataDir, FileMask, SNRMin, MakeFigures, SaveCsv, SaveMat, SavePng).
 % Совместимо с MATLAB и GNU Octave (не требует тулбоксов).
 
+function analyze_phase_diffs(overrides)
+
+if nargin < 1, overrides = struct(); end
+
 %% ------------------------- НАСТРОЙКИ -----------------------------------
-DataDir    = 'testdata';    % папка с файлами data_<time>_<f>_<fd>.bin
+DataDir    = '191126';    % папка с файлами data_<time>_<f>_<fd>.bin
                            % (можно задать полный путь)
 FileMask   = 'data_*_*.bin';% маска файлов анализа
 SNRMin     = 20;            % мин. SNR тона, дБ (ниже — файл помечается)
+MakeFigures= true;          % false -> только расчёт и CSV/MAT (headless-запуск)
 SaveCsv    = true;          % выгрузка CSV
 SaveMat    = true;          % выгрузка .mat
-SavePng    = true;          % сохранение окон в PNG
+SavePng    = true;          % сохранение окон в PNG (требует MakeFigures)
+
+% применение переопределений (analyze_phase_diffs(struct('DataDir',...)))
+ovFields = fieldnames(overrides);
+for iv = 1:numel(ovFields)
+    if isfield(overrides, ovFields{iv})
+        eval([ovFields{iv}, ' = overrides.', ovFields{iv}, ';']);
+    end
+end
+%% ------------------------------------------------------------------------
 %% ------------------------------------------------------------------------
 
 thisDir = fileparts(mfilename('fullpath'));
@@ -65,7 +84,7 @@ for i = 1:numel(files)
     fname = files{i};
     [p, fext] = fileparts(fname);
     assert(isempty(p)); %#ok<ASRTUC>  % файлы плоские
-    parts = regexp(fext, '^data_(\d+)_(\d+)_(\d+)$', 'tokens', 'once');
+    parts = regexp(fext, '^data_(\d+)_([+-]?\d+)_([+-]?\d+)$', 'tokens', 'once');
     [iq, hdr] = read_iq_capture(fullfile(DataDir, fname));
     if isempty(parts)
         fprintf('[%2d/%2d] %s: имя не разобрано, fc=%g МГц, fd ищу по спектру\n', ...
@@ -75,7 +94,7 @@ for i = 1:numel(files)
         fdMHz = NaN;
     else
         fcMHz = str2double(parts{2});
-        fdMHz = str2double(parts{3});
+        fdMHz = str2double(parts{3});      % знак сохраняется (-5 == тон на -5 МГц)
         fdHint = fdMHz * 1e6;
         % сверка с заголовком
         if abs(hdr.fc - fcMHz*1e6) > 1
@@ -117,9 +136,11 @@ for i = 1:numel(files)
 end
 
 %% --- окно 1: матрицы Δφ 4x4 для каждого файла -------------------------------
+nFiles = numel(files);
+fig1 = [];
+if MakeFigures
 fig1 = figure('Name', 'Матрицы разности фаз', 'Color', 'w', ...
               'Position', [40 40 1200 720]);
-nFiles = numel(files);
 ncols = ceil(sqrt(nFiles));
 nrows = ceil(nFiles / ncols);
 for i = 1:nFiles
@@ -156,8 +177,11 @@ end
 if exist('sgtitle', 'file') || exist('sgtitle', 'builtin')
     sgtitle('Матрицы Δφ = φ_i − φ_j (град), строки минус столбцы');
 end
+end % MakeFigures
 
 %% --- окно 2: Δφ_k - φ_1 по файлам и Δφ(fd) ----------------------------------
+fig2 = [];
+if MakeFigures
 fig2 = figure('Name', 'Разности фаз и закономерность', 'Color', 'w', ...
               'Position', [80 80 1150 760]);
 
@@ -218,8 +242,8 @@ hold on;
 for k = 2:nChMax
     x = []; y = [];
     for i = 1:nFiles
-        if R(i).tone && numel(R(i).dphiDeg) >= k
-            tau = -R(i).dphiDeg(k) / (0.36 * R(i).fdMHz); % нс
+        if R(i).tone && numel(R(i).dphiDeg) >= k && R(i).fdMHz ~= 0
+            tau = -R(i).dphiDeg(k) / (0.36 * R(i).fdMHz); % нс (знак fd учтён)
             x(end+1) = R(i).fdMHz; %#ok<*AGROW>
             y(end+1) = tau; %#ok<*AGROW>
         end
@@ -231,7 +255,8 @@ for k = 2:nChMax
 end
 grid on; hold off;
 xlabel('fd, МГц'); ylabel('Δτ_k = −Δφ/(0.36·fd), нс');
-title('Оценка межканальной задержки по каждому файлу');
+title('Оценка межканальной задержки по каждому файлу (fd со знаком)');
+end % MakeFigures
 
 %% --- оценка суммарной задержки (фит Δφ = −0.36·fd·Δτ, fd в МГц, τ в нс) ----
 fprintf('\n=== Оценка межканальных задержек (фит Δφ(fd) = −0.36·fd·Δτ) ===\n');
@@ -248,15 +273,28 @@ for k = 2:nChMax
     if numel(x) >= 2
         % Grid-search по Δτ: невязка каждой точки с заворотом на 360°,
         % поэтому метод корректен при любом разбросе fd и любых заворотах фазы.
-        % ВАЖНО: Δτ и Δτ + 1/gcd(fd) неразличимы. Если все fd кратны 5 МГц,
+        % ВАЖНО: Δτ и Δτ + 1/gcd(|fd|) неразличимы. Неоднозначность считается
+        % по НОД модулей fd (а не по минимальной разности: для набора
+        % {±5, ±10, ...} минимальная разность 10 МГц дала бы неверные 100 нс,
+        % а НОД = 5 МГц даёт верные 200 нс). Если все fd кратны 5 МГц,
         % задержка определена с точностью до 200 нс — результат приводится
-        % к диапазону [-1/(2*шаг), 1/(2*шаг)] нс. Для однозначности
+        % к диапазону [-1/(2*gcd), 1/(2*gcd)] нс. Для однозначности
         % записывайте файлы со взаимно простыми fd (например, 10 и 13 МГц).
-        fdStep = min(diff(sort(unique(x))));
-        if numel(unique(x)) > 1
-            tauAmb = 1e3 / fdStep;           % нс — период неоднозначности (fdStep в МГц)
+        % Знак fd учитывается в модели: Δφ = -0.36 * fd * Δτ (fd<0 меняет
+        % знак наклона, точки fd и -fd дают независимые уравнения).
+        xAbs = sort(unique(abs(x(x ~= 0))));   % |fd| без нулей, МГц
+        if isempty(xAbs)
+            taus(k) = NaN;
+            fprintf('ch%d-ch0: все fd = 0 — Δτ по Δφ не определить\n', k-1);
         else
-            tauAmb = 1e3 / x(1);
+        fdGcd = xAbs(1);
+        for ii = 2:numel(xAbs)
+            fdGcd = gcd_local(fdGcd, xAbs(ii));
+        end
+        if numel(xAbs) > 1 && fdGcd > 0
+            tauAmb = 1e3 / fdGcd;         % нс — период неоднозначности (НОД в МГц)
+        else
+            tauAmb = 1e3 / xAbs(1);
         end
         [xg, si] = sort(x);  yg = y(si);
         tauGrid = (-ceil(tauAmb/2):0.02:ceil(tauAmb/2));   % нс
@@ -282,9 +320,15 @@ for k = 2:nChMax
         tausStd(k) = bestRes;
         fprintf('ch%d-ch0: Δτ = %8.2f нс  (СКО невязки %.2f град, %d файлов, неоднозначность ±%.0f нс)\n', ...
                 k-1, bestTau, bestRes, numel(x), tauAmb/2);
+        end
     elseif numel(x) == 1
-        taus(k) = -y(1) / (0.36 * x(1));
-        fprintf('ch%d−ch0: Δτ = %8.2f нс  (единственный файл)\n', k-1, taus(k));
+        if x(1) ~= 0
+            taus(k) = -y(1) / (0.36 * x(1));
+            fprintf('ch%d−ch0: Δτ = %8.2f нс  (единственный файл)\n', k-1, taus(k));
+        else
+            taus(k) = NaN;
+            fprintf('ch%d−ch0: единственный файл с fd=0 — Δτ не определить\n', k-1);
+        end
     end
 end
 
@@ -346,11 +390,12 @@ if SaveMat
          'DataDir', 'SNRMin');
     fprintf('MAT сохранён: %s\n', matFile);
 end
-if SavePng
+if SavePng && MakeFigures && ~isempty(fig1)
     saveas(fig1, fullfile(outDir, 'phase_diff_matrices.png'));
     saveas(fig2, fullfile(outDir, 'phase_diff_summary.png'));
     fprintf('PNG сохранены в %s\n', outDir);
 end
+end % function analyze_phase_diffs
 
 %% ======================= локальные функции =================================
 function y = wrapdeg_local(x)
@@ -393,4 +438,15 @@ end
 
 function r = rms_local(x)
     r = sqrt(mean(x.^2));
+end
+
+function g = gcd_local(a, b)
+    %GCD_LOCAL  НОД двух чисел (Octave/MATLAB gcd требует целые, fd может
+    %быть дробным после str2double; для наших fd это целые МГц).
+    a = abs(a); b = abs(b);
+    while b > 1e-9
+        t = mod(a, b);
+        a = b; b = t;
+    end
+    g = a;
 end
