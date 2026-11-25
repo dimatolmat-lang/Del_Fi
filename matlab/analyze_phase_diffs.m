@@ -6,29 +6,44 @@
 %   - оценивает фазы каналов на частоте тона fd (из имени файла, со знаком);
 %   - строит матрицу разностей фаз 4x4 (теплокарта с числами) и кривые
 %     Δφ_k - Δφ_1 относительно канала 1 (ch0);
-%   - оценивает межканальные задержки Δτ = Δφ / (2*pi*fd);
-%   - сводный график Δφ(fd): если задержки каналов постоянны, точки для
-%     каждого канала лягут на прямую Δφ_k(fd) = -360*fd*Δτ_k (mod 360).
+%   - подгоняет модели Δφ_k(fd) по всем записям с тоном (fit_phase_model):
+%       M2: Δφ = −0.36·fd·Δτ            — только задержка (прежняя версия);
+%       M3: Δφ = C_k(fc) − 0.36·fd·Δτ   — офсет + задержка, СОВМЕСТНО по
+%                                         всем fc: одна Δτ_k на всё
+%                                         множество записей + офсеты C_k(fc);
+%     и выводит калибровочную таблицу (fc, C_k, Δτ_k) для компенсации
+%     каналов: x_k ← x_k·exp(−j·(C_k(fc) − 0.36·f·Δτ_k)), f — МГц от fc;
+%   - диагностирует адекватность: СКО невязки фита сравнивается с СКО
+%     измерения (dphi_*_std_deg); если невязка на порядок выше шума,
+%     печатается предупреждение «данные не описываются чисто задержечной
+%     моделью», а Δτ(M2) помечается неадекватным (флаг в CSV/MAT);
+%   - сводный график Δφ(fd) с линиями фита M3 и оценками Δτ по файлам.
 %
-% ВЫВОД РЕЗУЛЬТАТОВ:
-%   phase_diff_results.csv  — по строке на файл: fc, fd, SNR, фазы, Δφ_k-1,
-%                             Δτ_k-1, СКО Δφ;
-%   phase_diff_results.mat  — то же + полные матрицы Δφ каждого файла;
-%   консольная таблица + заключение о линейности Δφ(fd).
+% ВЫВОД РЕЗУЛЬТАТОВ (в папку данных):
+%   phase_diff_results.csv       — по строке на файл: fc, fd, SNR, фазы,
+%                                  Δφ_k-ch0 и их СКО (формат прежний);
+%   phase_diff_calibration.csv   — калибровочная таблица M3: по строке на
+%                                  (канал, fc) — C, Δτ, период
+%                                  неоднозначности, СКО невязок M2/M3,
+%                                  СКО измерения, флаги разделимости и
+%                                  адекватности;
+%   phase_diff_results.mat       — то же + полные матрицы Δφ каждого файла
+%                                  и все результаты фитов;
+%   консольные таблицы + предупреждения.
 %
 % НАСТРОЙКА: путь к папке с данными — в блоке НАСТРОЙКИ.
 % Запуск: analyze_phase_diffs (файл-функция — параметры внутри, локальные
 % функции ниже; скрипт-локальные функции Octave не поддерживает).
 % Опционально: analyze_phase_diffs(struct('DataDir', '...')) — переопределить
 % настройки (DataDir, FileMask, SNRMin, MakeFigures, SaveCsv, SaveMat, SavePng).
-% Совместимо с MATLAB и GNU Octave (не требует тулбоксов).
+% Совместимо с MATLAB (R2016b и новее) и GNU Octave (не требует тулбоксов).
 
 function analyze_phase_diffs(overrides)
 
 if nargin < 1, overrides = struct(); end
 
 %% ------------------------- НАСТРОЙКИ -----------------------------------
-DataDir    = '191126';    % папка с файлами data_<time>_<f>_<fd>.bin
+DataDir    = '251126';    % папка с файлами data_<time>_<f>_<fd>.bin
                            % (можно задать полный путь)
 FileMask   = 'data_*_*.bin';% маска файлов анализа
 SNRMin     = 20;            % мин. SNR тона, дБ (ниже — файл помечается)
@@ -179,6 +194,119 @@ if exist('sgtitle', 'file') || exist('sgtitle', 'builtin')
 end
 end % MakeFigures
 
+%% --- фиты моделей M2/M3 по всем записям (доработка по п. 6.1 отчёта) --------
+% M2: Δφ = −0.36·fd·Δτ           — только задержка (модель прежней версии);
+% M3: Δφ = C_k(fc) − 0.36·fd·Δτ  — офсет + задержка, СОВМЕСТНЫЙ фит по всем
+%                                  несущим: одна Δτ_k на всё множество
+%                                  записей + офсет C_k(fc) на каждой fc.
+% Адекватность: СКО невязки фита сравнивается с СКО измерения
+% (dphi_*_std_deg из CSV); невязка на порядок выше шума означает, что
+% данные не описываются чисто задержечной моделью — печатается
+% предупреждение, и Δτ(M2) помечается неадекватным (флаг в CSV/MAT).
+fprintf('\n=== Фиты моделей разности фаз (M2 — только задержка, M3 — офсет+задержка) ===\n');
+fcList = [];
+for i = 1:nFiles
+    if R(i).tone && isfinite(R(i).fcMHz)
+        fcList = unique([fcList, R(i).fcMHz]);
+    end
+end
+nFc = numel(fcList);
+tausM2     = nan(nChMax, 1);    % M2: задержка, нс
+tausStdM2  = nan(nChMax, 1);    % СКО невязки M2, град
+tausM3     = nan(nChMax, 1);    % M3: совместная задержка (все fc), нс
+tausStdM3  = nan(nChMax, 1);    % СКО невязки M3, град
+Ck         = nan(nChMax, nFc);  % офсеты C_k(fc), град
+tauAmb     = nan(nChMax, 1);    % период неоднозначности M3, нс
+                                      % (1000/НОД разностей fd внутри fc)
+tauAmbM2   = nan(nChMax, 1);    % период неоднозначности M2, нс (1000/НОД|fd|)
+noiseStd   = nan(nChMax, 1);    % СКО измерения Δφ (медиана), град
+m2Adequate = true(nChMax, 1);   % false = чисто задержечная модель неприменима
+separableK = true(nChMax, 1);   % данные определяют и C, и Δτ
+hasPairsK  = true(nChMax, 1);   % у всех |fd| есть пары ±fd
+warnTxt    = cell(nChMax, 1);   % предупреждения фита M3
+
+for k = 2:nChMax
+    x = []; y = []; fv = []; sv = [];
+    for i = 1:nFiles
+        if R(i).tone && numel(R(i).dphiDeg) >= k ...
+                && isfinite(R(i).fcMHz) && isfinite(R(i).fdMHz)
+            x(end+1)  = R(i).fdMHz;         %#ok<*AGROW>
+            y(end+1)  = R(i).dphiDeg(k);    %#ok<*AGROW>
+            fv(end+1) = R(i).fcMHz;         %#ok<*AGROW>
+            sv(end+1) = R(i).dphiStdDeg(k); %#ok<*AGROW>
+        end
+    end
+    if isempty(x)
+        fprintf('ch%d−ch0: нет записей с детектированным тоном — фит пропущен\n', k-1);
+        m2Adequate(k) = false; separableK(k) = false; hasPairsK(k) = false;
+        continue;
+    end
+    fprintf('ch%d−ch0 (%d записей, %d несущих):\n', k-1, numel(x), numel(unique(fv)));
+    f = fit_phase_model(x, y, fv, 'Verbose', true);
+    if isfinite(f.M2.tau)
+        tausM2(k) = f.M2.tau;  tausStdM2(k) = f.M2.rms;
+    end
+    if isfinite(f.M3.tau)
+        tausM3(k) = f.M3.tau;  tausStdM3(k) = f.M3.rms;
+        for jf = 1:nFc
+            jj = find(abs(f.M3.fc - fcList(jf)) < 1e-9, 1);
+            if ~isempty(jj), Ck(k, jf) = f.M3.C(jj); end
+        end
+    end
+    tauAmb(k)   = f.ambNs;
+    tauAmbM2(k) = f.ambM2Ns;
+    if ~isempty(sv), noiseStd(k) = median(sv); end
+    separableK(k) = f.separable;
+    hasPairsK(k)  = f.hasPairs;
+    warnTxt{k}    = f.warnM3;
+
+    % --- диагностика адекватности: невязка M2 против шума измерения ---
+    if isfinite(tausStdM2(k)) && isfinite(noiseStd(k)) && noiseStd(k) > 0 ...
+            && tausStdM2(k) / noiseStd(k) > 10
+        m2Adequate(k) = false;
+        fprintf(['  ВНИМАНИЕ (ch%d−ch0): СКО невязки M2 = %.1f град при шуме ' ...
+                 'измерения %.3f град — данные НЕ описываются чисто ' ...
+                 'задержечной моделью (доминирует офсет): Δτ(M2) = %+.2f нс ' ...
+                 'не является задержкой канала, используйте M3.\n'], ...
+                k-1, tausStdM2(k), noiseStd(k), tausM2(k));
+    end
+    fprintf('\n');
+end
+
+%% --- калибровочная таблица M3 -------------------------------------------------
+if any(isfinite(tausM3))
+    fprintf(['\n=== Калибровочная таблица M3: офсеты C_k(fc), град; ' ...
+             'Δτ_k общая на все fc, нс ===\n']);
+    fprintf('%10s', 'fc, МГц');
+    for k = 2:nChMax
+        fprintf(' %12s', sprintf('C(ch%d−ch0)', k-1));
+    end
+    fprintf('\n');
+    for jf = 1:nFc
+        fprintf('%10g', fcList(jf));
+        for k = 2:nChMax
+            if isfinite(Ck(k, jf)), fprintf(' %12.2f', Ck(k, jf));
+            else, fprintf(' %12s', '—'); end
+        end
+        fprintf('\n');
+    end
+    fprintf('%10s', 'Δτ_k, нс');
+    for k = 2:nChMax
+        if isfinite(tausM3(k)), fprintf(' %12.2f', tausM3(k));
+        else, fprintf(' %12s', '—'); end
+    end
+    fprintf('\n');
+    fprintf('%10s', 'амб, нс');
+    for k = 2:nChMax
+        if isfinite(tauAmb(k)), fprintf(' %12.0f', tauAmb(k));
+        elseif isnan(tauAmb(k)), fprintf(' %12s', '—');
+        else, fprintf(' %12s', 'Inf'); end
+    end
+    fprintf('   (период неоднозначности M3)\n');
+    fprintf(['Компенсация канала: x_k ← x_k·exp(−j·(C_k(fc) − 0.36·f·Δτ_k)), ' ...
+             'f — МГц от fc (модель валидна в полосе снятых |fd|).\n']);
+end
+
 %% --- окно 2: Δφ_k - φ_1 по файлам и Δφ(fd) ----------------------------------
 fig2 = [];
 if MakeFigures
@@ -231,9 +359,29 @@ for k = 2:nChMax
              'MarkerFaceColor', cols(k, :));
     end
 end
+% линии совместного фита M3: Δφ = C_k(fc) − 0.36·fd·Δτ_k (по каждой fc)
+for k = 2:nChMax
+    if ~isfinite(tausM3(k)), continue; end
+    lineCol = 0.55 * cols(k, :) + 0.45;    % светлее цвета канала
+    for jf = 1:nFc
+        fdl = [];
+        for i = 1:nFiles
+            if R(i).tone && isfinite(R(i).fcMHz) ...
+                    && abs(R(i).fcMHz - fcList(jf)) < 1e-9 ...
+                    && isfinite(R(i).fdMHz)
+                fdl(end+1) = R(i).fdMHz; %#ok<*AGROW>
+            end
+        end
+        if isempty(fdl) || ~isfinite(Ck(k, jf)), continue; end
+        xd = linspace(min(fdl), max(fdl), 200);
+        ym = wrapdeg_local(Ck(k, jf) - 0.36 * xd * tausM3(k));
+        ym([false, abs(diff(ym)) > 180]) = NaN;   % разрывы на заворотах ±360°
+        plot(xd, ym, ':', 'Color', lineCol, 'LineWidth', 1.3);
+    end
+end
 grid on; hold off;
 xlabel('fd, МГц'); ylabel('Δφ_k − φ_{ch0}, град');
-title('Δφ от частоты смещения (разворот на 360° — ожидание)');
+title('Δφ от fd: точки и совместный фит M3 (пунктир, по fc)');
 ylim([-190 190]);
 
 % 2в: оценка задержек Δτ_k = Δφ / (−2π fd) — накопление по fd
@@ -253,84 +401,26 @@ for k = 2:nChMax
              'MarkerSize', 7);
     end
 end
-grid on; hold off;
-xlabel('fd, МГц'); ylabel('Δτ_k = −Δφ/(0.36·fd), нс');
-title('Оценка межканальной задержки по каждому файлу (fd со знаком)');
-end % MakeFigures
-
-%% --- оценка суммарной задержки (фит Δφ = −0.36·fd·Δτ, fd в МГц, τ в нс) ----
-fprintf('\n=== Оценка межканальных задержек (фит Δφ(fd) = −0.36·fd·Δτ) ===\n');
-taus = nan(nChMax, 1);
-tausStd = nan(nChMax, 1);
-for k = 2:nChMax
-    x = []; y = [];
-    for i = 1:nFiles
-        if R(i).tone && numel(R(i).dphiDeg) >= k
-            x(end+1) = R(i).fdMHz;  %#ok<*AGROW>
-            y(end+1) = R(i).dphiDeg(k); %#ok<*AGROW>
-        end
+% совместные оценки Δτ_k (M3) — горизонтальные пунктирные линии
+fdAll = [];
+for i = 1:nFiles
+    if R(i).tone && isfinite(R(i).fdMHz)
+        fdAll = [fdAll, R(i).fdMHz]; %#ok<*AGROW>
     end
-    if numel(x) >= 2
-        % Grid-search по Δτ: невязка каждой точки с заворотом на 360°,
-        % поэтому метод корректен при любом разбросе fd и любых заворотах фазы.
-        % ВАЖНО: Δτ и Δτ + 1/gcd(|fd|) неразличимы. Неоднозначность считается
-        % по НОД модулей fd (а не по минимальной разности: для набора
-        % {±5, ±10, ...} минимальная разность 10 МГц дала бы неверные 100 нс,
-        % а НОД = 5 МГц даёт верные 200 нс). Если все fd кратны 5 МГц,
-        % задержка определена с точностью до 200 нс — результат приводится
-        % к диапазону [-1/(2*gcd), 1/(2*gcd)] нс. Для однозначности
-        % записывайте файлы со взаимно простыми fd (например, 10 и 13 МГц).
-        % Знак fd учитывается в модели: Δφ = -0.36 * fd * Δτ (fd<0 меняет
-        % знак наклона, точки fd и -fd дают независимые уравнения).
-        xAbs = sort(unique(abs(x(x ~= 0))));   % |fd| без нулей, МГц
-        if isempty(xAbs)
-            taus(k) = NaN;
-            fprintf('ch%d-ch0: все fd = 0 — Δτ по Δφ не определить\n', k-1);
-        else
-        fdGcd = xAbs(1);
-        for ii = 2:numel(xAbs)
-            fdGcd = gcd_local(fdGcd, xAbs(ii));
-        end
-        if numel(xAbs) > 1 && fdGcd > 0
-            tauAmb = 1e3 / fdGcd;         % нс — период неоднозначности (НОД в МГц)
-        else
-            tauAmb = 1e3 / xAbs(1);
-        end
-        [xg, si] = sort(x);  yg = y(si);
-        tauGrid = (-ceil(tauAmb/2):0.02:ceil(tauAmb/2));   % нс
-        bestRes = inf; bestTau = NaN;
-        for tau = tauGrid
-            % модель: Δφ_model = -0.36 * fd[МГц] * τ[нс] (т.е. -2π·f·τ)
-            res = wrapdeg_local(yg - (-0.36 * xg * tau));
-            r2 = rms_local(res);
-            if r2 < bestRes, bestRes = r2; bestTau = tau; end
-        end
-        % уточнение: золотое сечение вокруг bestTau с шагом сетки
-        step = 0.02;
-        lo = bestTau - step; hi = bestTau + step;
-        for it = 1:40
-            m1 = lo + (hi - lo) * 0.382;  m2 = hi - (hi - lo) * 0.382;
-            r1 = rms_local(wrapdeg_local(yg - (-0.36 * xg * m1)));
-            r2 = rms_local(wrapdeg_local(yg - (-0.36 * xg * m2)));
-            if r1 < r2, hi = m2; else, lo = m1; end
-        end
-        bestTau = (lo + hi) / 2;
-        bestRes = rms_local(wrapdeg_local(yg - (-0.36 * xg * bestTau)));
-        taus(k) = bestTau;     % нс
-        tausStd(k) = bestRes;
-        fprintf('ch%d-ch0: Δτ = %8.2f нс  (СКО невязки %.2f град, %d файлов, неоднозначность ±%.0f нс)\n', ...
-                k-1, bestTau, bestRes, numel(x), tauAmb/2);
-        end
-    elseif numel(x) == 1
-        if x(1) ~= 0
-            taus(k) = -y(1) / (0.36 * x(1));
-            fprintf('ch%d−ch0: Δτ = %8.2f нс  (единственный файл)\n', k-1, taus(k));
-        else
-            taus(k) = NaN;
-            fprintf('ch%d−ch0: единственный файл с fd=0 — Δτ не определить\n', k-1);
+end
+if ~isempty(fdAll)
+    xr = [min(fdAll) - 1, max(fdAll) + 1];
+    for k = 2:nChMax
+        if isfinite(tausM3(k))
+            plot(xr, [tausM3(k) tausM3(k)], ':', 'Color', cols(k, :), ...
+                 'LineWidth', 1.5);
         end
     end
 end
+grid on; hold off;
+xlabel('fd, МГц'); ylabel('Δτ_k = −Δφ/(0.36·fd), нс');
+title('Оценка задержки по файлам; пунктир — совместная Δτ (M3)');
+end % MakeFigures
 
 %% --- консольная таблица ------------------------------------------------------
 fprintf('\n=== Сводная таблица (Δφ относительно ch0, град) ===\n');
@@ -383,11 +473,31 @@ if SaveCsv
     end
     fclose(fid);
     fprintf('CSV сохранён: %s\n', csvFile);
+    % калибровочная таблица M3: по строке на (канал, fc)
+    calFile = fullfile(outDir, 'phase_diff_calibration.csv');
+    fid = fopen(calFile, 'w');
+    fprintf(fid, ['ch,fc_MHz,C_deg,dtau_ns,dtau_amb_ns,dtau_amb_m2_ns,' ...
+                  'rms_m2_deg,rms_m3_deg,noise_std_deg,separable,' ...
+                  'has_pm_pairs,m2_adequate\n']);
+    for k = 2:nChMax
+        for jf = 1:nFc
+            if isfinite(Ck(k, jf))
+                fprintf(fid, 'ch%d,%g,%.3f,%.3f,%.1f,%.1f,%.3f,%.3f,%.4f,%d,%d,%d\n', ...
+                        k-1, fcList(jf), Ck(k, jf), tausM3(k), tauAmb(k), ...
+                        tauAmbM2(k), tausStdM2(k), tausStdM3(k), noiseStd(k), ...
+                        separableK(k), hasPairsK(k), m2Adequate(k));
+            end
+        end
+    end
+    fclose(fid);
+    fprintf('CSV калибровки сохранён: %s\n', calFile);
 end
 if SaveMat
     matFile = fullfile(outDir, 'phase_diff_results.mat');
-    save(matFile, 'R', 'taus', 'tausStd', 'files', 'nChMax', ...
-         'DataDir', 'SNRMin');
+    save(matFile, 'R', 'files', 'nChMax', 'DataDir', 'SNRMin', ...
+         'fcList', 'tausM2', 'tausStdM2', 'tausM3', 'tausStdM3', 'Ck', ...
+         'tauAmb', 'tauAmbM2', 'noiseStd', 'm2Adequate', 'separableK', ...
+         'hasPairsK', 'warnTxt');
     fprintf('MAT сохранён: %s\n', matFile);
 end
 if SavePng && MakeFigures && ~isempty(fig1)
@@ -434,19 +544,4 @@ function cols = lines_local(n)
             0.635 0.078 0.184];
     cols = repmat(base, ceil(n / size(base, 1)), 1);
     cols = cols(1:n, :);
-end
-
-function r = rms_local(x)
-    r = sqrt(mean(x.^2));
-end
-
-function g = gcd_local(a, b)
-    %GCD_LOCAL  НОД двух чисел (Octave/MATLAB gcd требует целые, fd может
-    %быть дробным после str2double; для наших fd это целые МГц).
-    a = abs(a); b = abs(b);
-    while b > 1e-9
-        t = mod(a, b);
-        a = b; b = t;
-    end
-    g = a;
 end
